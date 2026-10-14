@@ -1,0 +1,8 @@
+/build/
+/out/
+/artifacts/
+/.vs/
+*.user
+*.suo
+__pycache__/
+README_local.md

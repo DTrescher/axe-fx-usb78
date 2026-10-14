@@ -1,0 +1,105 @@
+name: Build and publish release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  release:
+    runs-on: windows-2022
+    permissions:
+      contents: write
+    steps:
+      - name: Check out tagged source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Validate tag and project version
+        shell: pwsh
+        run: |
+          $tag = $env:GITHUB_REF_NAME
+          if ($tag -notmatch '^v(?<version>\d+\.\d+\.\d+)$') {
+              throw "Release tags must use vMAJOR.MINOR.PATCH; received '$tag'."
+          }
+
+          $cmake = Get-Content -LiteralPath 'CMakeLists.txt' -Raw
+          $match = [regex]::Match(
+              $cmake,
+              '(?m)^project\(\s*\S+\s+VERSION\s+(?<version>\d+\.\d+\.\d+)'
+          )
+          if (-not $match.Success) {
+              throw 'Could not read the project version from CMakeLists.txt.'
+          }
+
+          $projectVersion = $match.Groups['version'].Value
+          if ($tag.Substring(1) -ne $projectVersion) {
+              throw "Tag $tag does not match CMake project version $projectVersion."
+          }
+
+          "APP_VERSION=$projectVersion" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+
+      - name: Download and verify Inno Setup
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $assetName = 'innosetup-7.1.0-x64.exe'
+          $assetPath = Join-Path $env:RUNNER_TEMP $assetName
+          $assetUrl = 'https://github.com/jrsoftware/issrc/releases/download/is-7_1_0/innosetup-7.1.0-x64.exe'
+
+          Invoke-WebRequest -Uri $assetUrl -OutFile $assetPath
+          & gh release verify-asset $assetPath --repo jrsoftware/issrc
+          if ($LASTEXITCODE -ne 0) {
+              throw 'The Inno Setup release attestation could not be verified.'
+          }
+
+          $signature = Get-AuthenticodeSignature -FilePath $assetPath
+          if ($signature.Status -ne 'Valid' -or
+              $signature.SignerCertificate.GetNameInfo(
+                  [System.Security.Cryptography.X509Certificates.X509NameType]::SimpleName,
+                  $false
+              ) -ne 'Pyrsys B.V.') {
+              throw 'The Inno Setup Authenticode signature is invalid or has an unexpected publisher.'
+          }
+
+          $install = Start-Process -FilePath $assetPath -ArgumentList @('/VERYSILENT', '/SUPPRESSMSGBOXES', '/NORESTART', '/SP-') -Wait -PassThru
+          if ($install.ExitCode -notin @(0, 3010)) {
+              throw "Inno Setup installation failed with exit code $($install.ExitCode)."
+          }
+
+      - name: Build Windows installer
+        shell: pwsh
+        run: .\tools\build-installer.ps1
+
+      - name: Create SHA-256 checksum
+        shell: pwsh
+        run: |
+          $installer = Join-Path $env:GITHUB_WORKSPACE "artifacts\installer\axe-fx-usb78-setup-$env:APP_VERSION.exe"
+          if (-not (Test-Path -LiteralPath $installer -PathType Leaf)) {
+              throw "Installer was not created: $installer"
+          }
+
+          $hash = (Get-FileHash -LiteralPath $installer -Algorithm SHA256).Hash.ToLowerInvariant()
+          $checksumPath = "$installer.sha256"
+          $checksum = '{0}  {1}{2}' -f $hash, [System.IO.Path]::GetFileName($installer), [Environment]::NewLine
+          [System.IO.File]::WriteAllText($checksumPath, $checksum, [System.Text.Encoding]::ASCII)
+
+      - name: Publish GitHub Release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $installer = Join-Path $env:GITHUB_WORKSPACE "artifacts\installer\axe-fx-usb78-setup-$env:APP_VERSION.exe"
+          & gh release create $env:GITHUB_REF_NAME $installer "$installer.sha256" --verify-tag --generate-notes --title "Axe-Fx USB 7-8 Audio Router $env:GITHUB_REF_NAME" --repo $env:GITHUB_REPOSITORY
+          if ($LASTEXITCODE -ne 0) {
+              throw 'GitHub Release creation failed.'
+          }
